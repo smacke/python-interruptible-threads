@@ -1,0 +1,2 @@
+include README.md docs/LICENSE.txt
+recursive-exclude tests *

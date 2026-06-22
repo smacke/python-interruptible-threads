@@ -1,0 +1,17 @@
+**/.DS_Store
+**/.vscode
+**/__pycache__
+**/.mypy_cache
+**/.pytest_cache
+**/.ipynb_checkpoints
+**/.ruff_cache
+build/
+dist/
+*.egg-info
+*.pyc
+MANIFEST
+.coverage
+coverage.xml
+htmlcov/**
+.hypothesis
+.venv/

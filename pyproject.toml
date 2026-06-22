@@ -1,0 +1,35 @@
+[build-system]
+requires = [
+    "setuptools >= 48",
+    "wheel >= 0.30.0",
+    "setuptools-git-versioning",
+]
+build-backend = 'setuptools.build_meta'
+
+[tool.setuptools-git-versioning]
+enabled = true
+
+[tool.black]
+line-length = 88
+target-version = ['py39']
+
+[tool.isort]
+profile = 'black'
+
+[tool.pytest.ini_options]
+testpaths = ['tests']
+timeout = 60
+filterwarnings = [
+    'ignore::DeprecationWarning',
+]
+
+[tool.coverage.run]
+source = ['interruptible_threading']
+
+[tool.coverage.report]
+exclude_lines = [
+    'pragma: no cover *$',
+    '^ *if TYPE_CHECKING:',
+    '^ *raise',
+    '^ *\.\.\.',
+]

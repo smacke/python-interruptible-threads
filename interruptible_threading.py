@@ -1,62 +1,170 @@
 """
-Exposes an InterruptibleThread class that raises KeyboardInterrupt when `thread.interrupt()` is called.
-Requires monkey patching some stdlib functionality via `InterruptibleThread.install_patches()`.
+Cooperative thread interruption for CPython.
+
+Exposes an :class:`InterruptibleThread` whose :meth:`~InterruptibleThread.interrupt`
+method raises an exception (``ThreadInterrupted`` by default) inside the target
+thread. Pure-Python code is interrupted via ``PyThreadState_SetAsyncExc`` (an async
+exception that fires at the next bytecode boundary). Because async exceptions cannot
+break a thread that is parked in a C-level blocking call, ``install_patches()``
+monkeypatches a curated set of stdlib blocking primitives (``time.sleep``,
+``selectors.DefaultSelector``, ``select.select``, ``threading.Condition.wait``) so
+they wake promptly and re-check a durable per-thread "interrupt pending" flag.
+
+The flag is the single source of truth: ``interrupt()`` sets it first (under one
+lock) and then issues a wakeup nudge; every blocking primitive checks the flag
+before parking and again after waking. This closes the races inherent in choosing a
+delivery path from transient state, and lets interrupts be *masked* during critical
+sections (``critical_section()``) and *polled* in CPU-bound loops (``check_interrupt()``).
+
+Requires monkey patching some stdlib functionality via
+``InterruptibleThread.install_patches()``. CPython only; POSIX (Linux / Darwin).
+
+Why not signals: ``signal.pthread_kill`` can unblock a syscall but cannot deliver an
+exception to a worker thread -- CPython runs Python-level signal handlers only on the
+main thread, and PEP 475's EINTR auto-retry loops call ``PyErr_CheckSignals()``
+(a no-op off the main thread) without consulting ``tstate->async_exc``, so the
+syscall is transparently retried. The self-pipe + cooperative-primitive approach is
+the only way to get prompt, exception-bearing interruption of worker threads.
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import os
-import selectors
 import select
+import selectors
+import socket as _socket
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from io import IOBase
 
+__all__ = [
+    "InterruptibleThread",
+    "ThreadInterrupted",
+    "is_interrupted",
+    "clear_interrupt",
+    "check_interrupt",
+    "interruptible_checkpoint",
+    "periodic_checkpoint",
+    "critical_section",
+    "interrupts_disabled",
+    "interruptible_recv",
+    "interruptible_send",
+    "interruptible_accept",
+    "set_poll_interval",
+]
+
+
+class ThreadInterrupted(BaseException):
+    """Raised inside a thread when another thread calls ``.interrupt()`` on it.
+
+    Subclasses ``BaseException`` (not ``Exception``) so that ordinary
+    ``except Exception:`` handlers do not accidentally swallow it -- mirroring
+    ``KeyboardInterrupt`` and ``asyncio.CancelledError``.
+    """
+
+
+class _ThreadInterruptedKeyboard(ThreadInterrupted, KeyboardInterrupt):
+    """Legacy-compatible interrupt: caught by both ``ThreadInterrupted`` and
+    ``KeyboardInterrupt`` handlers. Used when ``legacy_keyboardinterrupt=True``."""
+
+
+# The exception class delivered by interrupt(); swapped by install_patches().
+_INTERRUPT_EXC: type[BaseException] = ThreadInterrupted
 
 _PTSSE = ctypes.pythonapi.PyThreadState_SetAsyncExc
 _PTSSE.argtypes = [ctypes.c_ulong, ctypes.py_object]
 _PTSSE.restype = ctypes.c_int
 _MAIN_IDENT = threading.main_thread().ident
+
 _ORIG_SLEEP = time.sleep
 _ORIG_DEFAULT_SELECTOR = selectors.DefaultSelector
 _ORIG_SELECT = select.select
 _ORIG_THREAD = threading.Thread
+_ORIG_COND_WAIT = threading.Condition.wait
+
+_WAKEUP_TOKEN = "__interruptible_wakeup__"
+
+# Max latency (seconds) for chunked-poll primitives (Condition.wait / Event / Queue).
+_POLL_INTERVAL = 0.05
 
 
-class _Lockable(type):
-    def __enter__(cls: _State):
-        return cls.registry_lock.__enter__()
-
-    def __exit__(cls: _State, exc_type, exc_val, exc_tb):
-        return cls.registry_lock.__exit__(exc_type, exc_val, exc_tb)
+def set_poll_interval(seconds: float) -> None:
+    """Tune the wakeup latency of the chunked-poll blocking primitives."""
+    global _POLL_INTERVAL
+    _POLL_INTERVAL = float(seconds)
 
 
-class _State(metaclass=_Lockable):
+def _clear_async_exc(tid: int | None = None) -> None:
+    """Clear any async exception armed for ``tid`` (default: current thread).
+
+    Called right before raising on a cooperative path so an exception armed by
+    ``interrupt()`` does not fire a second time at the next bytecode boundary.
+    """
+    # An empty py_object() is a NULL pointer, which tells SetAsyncExc to *clear*
+    # the pending async exception. Passing Python ``None`` would instead arm None
+    # as the exception (raising SystemError when later delivered).
+    _PTSSE(
+        ctypes.c_ulong(tid if tid is not None else threading.get_ident()),
+        ctypes.py_object(),
+    )
+
+
+def _drain(fd: int) -> None:
+    """Drain a non-blocking wakeup pipe until empty."""
+    while True:
+        try:
+            if not os.read(fd, 65536):
+                break
+        except (BlockingIOError, OSError):
+            break
+
+
+class _State:
     registry_lock = threading.RLock()
     registry: dict[int, _State] = {}
 
     def __init__(self) -> None:
         cur_thread = threading.current_thread()
         if not isinstance(cur_thread, InterruptibleThread):
-            raise TypeError(f"current thread should be of type {InterruptibleThread.__name__}")
+            raise TypeError(
+                f"current thread should be of type {InterruptibleThread.__name__}"
+            )
         self.thread: InterruptibleThread = cur_thread
-        self.children_tids: list[int] = []
+        self.children: set[int] = set()
+        # cancel_cond's lock is the single per-thread mutex guarding all the
+        # mutable interrupt state below.
         self.cancel_cond = threading.Condition()
+        # Durable source of truth: an interrupt has been requested, not yet delivered.
+        self.pending = False
+        self.interrupt_gen = 0
+        self.mask_depth = 0
+        # Hints used only to pick a wakeup nudge; never the source of truth.
         self.sleeping = False
-        self.cancel_sleep_notified = False
         self.selecting = False
-        self.cancel_select_notified = False
-        r, w = os.pipe()
-        os.set_blocking(r, False)
-        self.rfd, self.wfd = r, w
+        # asyncio integration (set by run_interruptible).
+        self.event_loop: Any = None
+        self.root_task: Any = None
+        # Lazily-allocated self-pipe; only needed on the selector/select path.
+        self.rfd = -1
+        self.wfd = -1
+
+    def ensure_pipe(self) -> None:
+        """Allocate the self-pipe on first use (idempotent)."""
+        with self.cancel_cond:
+            if self.rfd == -1:
+                r, w = os.pipe()
+                os.set_blocking(r, False)
+                self.rfd, self.wfd = r, w
 
     @classmethod
     def register_current_thread(cls) -> _State:
         tid = threading.get_ident()
-        with cls:
+        with cls.registry_lock:
             st = cls.registry.get(tid)
             if st is None:
                 st = cls()
@@ -65,96 +173,268 @@ class _State(metaclass=_Lockable):
 
     @classmethod
     def get_state_by_ident(cls, tid: int | None = None) -> _State | None:
-        return cls.registry.get(tid or threading.get_ident())
+        return cls.registry.get(tid if tid is not None else threading.get_ident())
 
     @classmethod
     def unregister_current_thread(cls) -> None:
         tid = threading.get_ident()
-        with cls:
+        with cls.registry_lock:
             st = cls.registry.pop(tid, None)
             if not st:
                 return
             for fd in (st.rfd, st.wfd):
+                if fd == -1:
+                    continue
                 try:
                     os.close(fd)
                 except OSError:
                     pass
+            st.rfd = st.wfd = -1
+
+
+def _take_pending(st: _State) -> bool:
+    """If an unmasked interrupt is pending, consume it and clear any armed async
+    exception, returning True (caller should raise). Otherwise return False.
+
+    Must be called holding ``st.cancel_cond``.
+    """
+    if st.pending and st.mask_depth == 0:
+        st.pending = False
+        _clear_async_exc()
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# Public cooperative API (operates on the *current* thread)                    #
+# --------------------------------------------------------------------------- #
+
+
+def is_interrupted(thread: InterruptibleThread | None = None) -> bool:
+    """Return whether an interrupt is pending for ``thread`` (default: current).
+
+    Non-consuming; safe to call after the thread has exited (returns ``False``).
+    """
+    tid = thread.ident if thread is not None else threading.get_ident()
+    st = _State.get_state_by_ident(tid)
+    if st is None:
+        return False
+    with st.cancel_cond:
+        return st.pending
+
+
+def clear_interrupt() -> bool:
+    """Consume any pending interrupt for the current thread without raising.
+
+    Returns whether one was pending (Java's ``Thread.interrupted()`` semantics).
+    """
+    st = _State.get_state_by_ident()
+    if st is None:
+        return False
+    with st.cancel_cond:
+        prev = st.pending
+        st.pending = False
+        if prev:
+            _clear_async_exc()
+        return prev
+
+
+def check_interrupt() -> None:
+    """Raise the interrupt exception if one is pending and not masked.
+
+    Cheap; intended for CPU-bound loops and around opaque C calls so they become
+    interruptible while still honoring ``critical_section()``.
+    """
+    st = _State.get_state_by_ident()
+    if st is None:
+        return
+    with st.cancel_cond:
+        if _take_pending(st):
+            raise _INTERRUPT_EXC()
+
+
+# Alias.
+interruptible_checkpoint = check_interrupt
+
+
+@contextlib.contextmanager
+def periodic_checkpoint(every: int = 1000) -> Iterator[_Ticker]:
+    """Yield a ticker whose ``.tick()`` runs :func:`check_interrupt` every ``every``
+    calls, amortizing the per-iteration cost in a tight loop::
+
+        with periodic_checkpoint(every=1000) as ck:
+            for item in huge_iterable:
+                ck.tick()
+                crunch(item)
+    """
+    yield _Ticker(every)
+
+
+class _Ticker:
+    __slots__ = ("_every", "_n")
+
+    def __init__(self, every: int) -> None:
+        self._every = max(1, int(every))
+        self._n = 0
+
+    def tick(self) -> bool:
+        """Count one iteration; every Nth call runs check_interrupt(). Returns
+        whether the check ran this call."""
+        self._n += 1
+        if self._n >= self._every:
+            self._n = 0
+            check_interrupt()
+            return True
+        return False
+
+
+@contextlib.contextmanager
+def interrupts_disabled() -> Iterator[None]:
+    """Defer interrupt delivery to the current thread for the duration of the block.
+
+    An interrupt that arrives while masked is recorded and delivered exactly once
+    when the outermost mask exits (re-entrant). Reliable for the flag-driven paths
+    (sleep / select / Condition / checkpoints); an async exception already in flight
+    from ``SetAsyncExc`` microseconds before entering cannot be recalled.
+    """
+    st = _State.get_state_by_ident()
+    if st is None:
+        yield
+        return
+    with st.cancel_cond:
+        st.mask_depth += 1
+    try:
+        yield
+    finally:
+        raise_now = False
+        with st.cancel_cond:
+            st.mask_depth -= 1
+            if st.mask_depth == 0 and st.pending:
+                st.pending = False
+                _clear_async_exc()
+                raise_now = True
+        if raise_now:
+            raise _INTERRUPT_EXC()
+
+
+# Alias.
+critical_section = interrupts_disabled
+
+
+# --------------------------------------------------------------------------- #
+# Patched blocking primitives                                                  #
+# --------------------------------------------------------------------------- #
 
 
 def _coop_sleep(secs: float) -> None:
-    if threading.get_ident() == _MAIN_IDENT:
+    tid = threading.get_ident()
+    if tid == _MAIN_IDENT:
         return _ORIG_SLEEP(secs)
-    st = _State.get_state_by_ident()
-    if not st:
+    st = _State.get_state_by_ident(tid)
+    if st is None:
         return _ORIG_SLEEP(secs)
+    deadline = time.monotonic() + secs
     with st.cancel_cond:
-        st.sleeping = True
-        try:
-            st.cancel_cond.wait(timeout=secs)
-        finally:
-            st.sleeping = False
-    if st.cancel_sleep_notified:
-        raise KeyboardInterrupt()
+        while True:
+            if _take_pending(st):
+                raise _INTERRUPT_EXC()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            st.sleeping = True
+            try:
+                _ORIG_COND_WAIT(st.cancel_cond, remaining)
+            finally:
+                st.sleeping = False
+            # Loop: an unmasked pending flag raises at the top; a masked one keeps
+            # sleeping out the remaining time; spurious wakeups simply re-park.
+
+
+def _patched_cond_wait(self: threading.Condition, timeout: float | None = None) -> bool:
+    tid = threading.get_ident()
+    if tid == _MAIN_IDENT:
+        return _ORIG_COND_WAIT(self, timeout)
+    st = _State.get_state_by_ident(tid)
+    if st is None:
+        return _ORIG_COND_WAIT(self, timeout)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        with st.cancel_cond:
+            if _take_pending(st):
+                raise _INTERRUPT_EXC()
+        if deadline is None:
+            chunk = _POLL_INTERVAL
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            chunk = min(_POLL_INTERVAL, remaining)
+        if _ORIG_COND_WAIT(self, chunk):
+            return True
+        # Timed-out chunk: loop to re-check the pending flag.
 
 
 class _InterruptibleSelector(_ORIG_DEFAULT_SELECTOR):
+    """DefaultSelector that also watches the current thread's self-pipe, so an
+    interrupt can wake a parked ``select`` (this is what makes asyncio interruptible).
+    """
+
     def __init__(self) -> None:
-        self._inner = _ORIG_DEFAULT_SELECTOR()
-        st = self._st = _State.get_state_by_ident()
-        if st:
+        super().__init__()
+        st = self._ithr_st = _State.get_state_by_ident()
+        if st is not None:
+            st.ensure_pipe()
             try:
-                self._inner.register(st.rfd, selectors.EVENT_READ, data="__wakeup__")
-            except KeyError:
+                super().register(st.rfd, selectors.EVENT_READ, data=_WAKEUP_TOKEN)
+            except (KeyError, ValueError):
                 pass
 
-    def __getattr__(self, item: str) -> object:
-        return getattr(self._inner, item)
-
-    def select(self, timeout: float | None = None) -> list[tuple[selectors.SelectorKey, int]]:
-        if not self._st:
-            return self._inner.select(timeout)
-        with self._st.cancel_cond:
-            self._st.selecting = True
-        events = []
+    def select(self, timeout: float | None = None):
+        st = getattr(self, "_ithr_st", None)
+        if st is None:
+            return super().select(timeout)
+        with st.cancel_cond:
+            if _take_pending(st):
+                raise _INTERRUPT_EXC()
+            st.selecting = True
         try:
-            events = self._inner.select(timeout)
+            events = super().select(timeout)
         finally:
-            with self._st.cancel_cond:
-                self._st.selecting = False
-            select_cancelled = any(key.data == "__wakup__" for key, _ in events) or self._st.cancel_select_notified
+            with st.cancel_cond:
+                st.selecting = False
         out = []
         for key, mask in events:
-            if key.data == "__wakeup__":
-                try:
-                    while True:
-                        if os.read(key.fd, 1024) == b"":
-                            break
-                except (BlockingIOError, OSError):
-                    pass
+            if key.data == _WAKEUP_TOKEN:
+                _drain(key.fd)
                 continue
             out.append((key, mask))
-        if select_cancelled:
-            raise KeyboardInterrupt()
+        with st.cancel_cond:
+            if _take_pending(st):
+                raise _INTERRUPT_EXC()
         return out
 
 
 def _fileno(x: IOBase | int) -> int:
     try:
-        return x.fileno()
+        return x.fileno()  # type: ignore[union-attr]
     except AttributeError:
-        return int(x)  # type: ignore
+        return int(x)  # type: ignore[arg-type]
 
 
 def _patched_select(
-        rlist: list[IOBase | int], wlist: list[IOBase | int], xlist: list[IOBase | int], timeout: float | None = None
+    rlist: list[IOBase | int],
+    wlist: list[IOBase | int],
+    xlist: list[IOBase | int],
+    timeout: float | None = None,
 ) -> tuple[list[IOBase | int], list[IOBase | int], list[IOBase | int]]:
-    if threading.get_ident() == _MAIN_IDENT:
+    tid = threading.get_ident()
+    if tid == _MAIN_IDENT:
+        return _ORIG_SELECT(rlist, wlist, xlist, timeout)
+    st = _State.get_state_by_ident(tid)
+    if st is None:
         return _ORIG_SELECT(rlist, wlist, xlist, timeout)
 
-    st = _State.get_state_by_ident()
-    if not st:
-        return _ORIG_SELECT(rlist, wlist, xlist, timeout)
-
+    st.ensure_pipe()
     rfd = st.rfd
 
     def to_fd_list(lst: list[IOBase | int]) -> list[tuple[int, IOBase | int]]:
@@ -171,27 +451,25 @@ def _patched_select(
     if rfd not in rfd_list:
         rfd_list.append(rfd)
 
-    rr = []
     with st.cancel_cond:
+        if _take_pending(st):
+            raise _INTERRUPT_EXC()
         st.selecting = True
     try:
         rr, ww, xx = _ORIG_SELECT(rfd_list, wfd_list, xfd_list, timeout)
     finally:
         with st.cancel_cond:
             st.selecting = False
-            select_cancelled = rfd in rr or st.cancel_select_notified
 
     if rfd in rr:
-        try:
-            while True:
-                if os.read(rfd, 1024) == b"":
-                    break
-        except (BlockingIOError, OSError):
-            pass
-    if select_cancelled:
-        raise KeyboardInterrupt()
+        _drain(rfd)
+    with st.cancel_cond:
+        if _take_pending(st):
+            raise _INTERRUPT_EXC()
 
-    def map_back(fd_list: list[IOBase], fmap: list[tuple[int, IOBase | int]]) -> list[IOBase | int]:
+    def map_back(
+        fd_list: list[int], fmap: list[tuple[int, IOBase | int]]
+    ) -> list[IOBase | int]:
         fds = set(fd_list)
         return [obj for fd, obj in fmap if fd in fds]
 
@@ -202,68 +480,236 @@ def _patched_select(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Interruptible socket helpers (opt-in; reuse the self-pipe directly)          #
+# --------------------------------------------------------------------------- #
+
+
+def _interruptible_io(sock: _socket.socket, want_write: bool, op):
+    tid = threading.get_ident()
+    st = _State.get_state_by_ident(tid)
+    if st is None or tid == _MAIN_IDENT:
+        return op()
+    st.ensure_pipe()
+    prev_timeout = sock.gettimeout()
+    sock.setblocking(False)
+    try:
+        while True:
+            with st.cancel_cond:
+                if _take_pending(st):
+                    raise _INTERRUPT_EXC()
+                st.selecting = True
+            try:
+                if want_write:
+                    _rr, ww, _xx = _ORIG_SELECT([st.rfd], [sock], [])
+                    ready = sock in ww
+                else:
+                    rr, _ww, _xx = _ORIG_SELECT([sock, st.rfd], [], [])
+                    ready = sock in rr
+            finally:
+                with st.cancel_cond:
+                    st.selecting = False
+            _drain(st.rfd)
+            with st.cancel_cond:
+                if _take_pending(st):
+                    raise _INTERRUPT_EXC()
+            if ready:
+                try:
+                    return op()
+                except (BlockingIOError, InterruptedError):
+                    continue
+    finally:
+        sock.settimeout(prev_timeout)
+
+
+def interruptible_recv(sock: _socket.socket, bufsize: int, flags: int = 0) -> bytes:
+    """``sock.recv`` that raises the interrupt exception if interrupted while blocked."""
+    return _interruptible_io(sock, False, lambda: sock.recv(bufsize, flags))
+
+
+def interruptible_send(sock: _socket.socket, data: bytes, flags: int = 0) -> int:
+    """``sock.send`` that raises the interrupt exception if interrupted while blocked."""
+    return _interruptible_io(sock, True, lambda: sock.send(data, flags))
+
+
+def interruptible_accept(sock: _socket.socket):
+    """``sock.accept`` that raises the interrupt exception if interrupted while blocked."""
+    return _interruptible_io(sock, False, sock.accept)
+
+
+_ORIG_SOCK_RECV = _socket.socket.recv
+_ORIG_SOCK_SEND = _socket.socket.send
+_ORIG_SOCK_ACCEPT = _socket.socket.accept
+
+
+def _sock_recv_patch(self, bufsize, flags=0):
+    return interruptible_recv(self, bufsize, flags)
+
+
+def _sock_send_patch(self, data, flags=0):
+    return interruptible_send(self, data, flags)
+
+
+def _sock_accept_patch(self):
+    return interruptible_accept(self)
+
+
+# --------------------------------------------------------------------------- #
+# The thread class                                                             #
+# --------------------------------------------------------------------------- #
+
+
 class InterruptibleThread(_ORIG_THREAD):
-    """Thread with built-in cooperative interrupt()."""
+    """Thread with a built-in cooperative :meth:`interrupt`."""
 
     _patches_installed = False
+    _socket_patched = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._parent_tid = threading.get_ident()
 
     def run(self) -> None:
-        with _State:
+        with _State.registry_lock:
             _State.register_current_thread()
             parent_st = _State.get_state_by_ident(self._parent_tid)
             if parent_st is not None:
-                parent_st.children_tids.append(threading.get_ident())
+                parent_st.children.add(threading.get_ident())
         try:
             super().run()
         finally:
-            st = _State.get_state_by_ident(self.ident)
-            if st is None:
-                return
-            with st.cancel_cond:
-                _State.unregister_current_thread()
+            my_tid = threading.get_ident()
+            with _State.registry_lock:
+                parent_st = _State.get_state_by_ident(self._parent_tid)
+                if parent_st is not None:
+                    parent_st.children.discard(my_tid)
+                st = _State.get_state_by_ident(my_tid)
+            if st is not None:
+                with st.cancel_cond:
+                    _State.unregister_current_thread()
 
-    def _raise_keyboard_interrupt_in_thread(self) -> None:
-        rc = _PTSSE(ctypes.c_ulong(self.ident), ctypes.py_object(KeyboardInterrupt))
+    @classmethod
+    def run_interruptible(cls, coro):
+        """Run a coroutine via ``asyncio.run`` such that ``interrupt()`` cancels the
+        event loop's tasks cooperatively (clean ``finally``/``async with`` unwind)
+        instead of injecting an exception into the selector. Returns the coroutine's
+        result; re-raises the interrupt exception if interrupted."""
+        import asyncio
+
+        st = _State.get_state_by_ident()
+
+        async def _runner():
+            if st is not None:
+                with st.cancel_cond:
+                    st.event_loop = asyncio.get_running_loop()
+                    st.root_task = asyncio.current_task()
+            try:
+                return await coro
+            finally:
+                if st is not None:
+                    with st.cancel_cond:
+                        st.event_loop = None
+                        st.root_task = None
+
+        try:
+            return asyncio.run(_runner())
+        except asyncio.CancelledError:
+            if st is not None:
+                with st.cancel_cond:
+                    if _take_pending(st):
+                        raise _INTERRUPT_EXC() from None
+            raise
+
+    def _inject_exc(self) -> None:
+        tid = ctypes.c_ulong(self.ident or 0)
+        rc = _PTSSE(tid, ctypes.py_object(_INTERRUPT_EXC))
         if rc == 0:
             raise ValueError("no such thread")
         elif rc > 1:
-            _PTSSE(ctypes.c_ulong(self.ident), None)
+            _PTSSE(tid, ctypes.py_object())
             raise SystemError("SetAsyncExc affected multiple threads")
+
+    @staticmethod
+    def _pipe_write(st: _State) -> None:
+        if st.wfd != -1:
+            try:
+                os.write(st.wfd, b"\x00")
+            except OSError:
+                pass
+
+    def _nudge(self, st: _State) -> None:
+        """Wake the target out of any current park without arming an async exception.
+        Must be called holding ``st.cancel_cond``."""
+        st.cancel_cond.notify_all()
+        self._pipe_write(st)
+
+    def _cancel_event_loop(self, st: _State) -> None:
+        loop, task = st.event_loop, st.root_task
+
+        def _cancel():
+            if task is not None and not task.done():
+                task.cancel()
+
+        try:
+            loop.call_soon_threadsafe(_cancel)
+        except RuntimeError:
+            # Loop already closed; fall back to async injection.
+            self._inject_exc()
 
     def interrupt(self, recursive: bool = False) -> None:
         st = _State.get_state_by_ident(self.ident)
         if st is None:
             raise ValueError("no such thread")
-        for child_tid in (st.children_tids if recursive else []):
-            child_st = _State.get_state_by_ident(child_tid)
-            if child_st is None:
-                continue
-            child_thread = child_st.thread
-            if not child_thread.is_alive():
-                continue
-            try:
-                child_thread.interrupt(recursive=recursive)
-            except ValueError:
-                continue
+
+        if recursive:
+            with _State.registry_lock:
+                children = list(st.children)
+            for child_tid in children:
+                with _State.registry_lock:
+                    child_st = _State.get_state_by_ident(child_tid)
+                    child_thread = child_st.thread if child_st is not None else None
+                if (
+                    child_thread is None
+                    or child_thread.ident != child_tid
+                    or not child_thread.is_alive()
+                ):
+                    continue
+                try:
+                    child_thread.interrupt(recursive=True)
+                except ValueError:
+                    continue
+
         with st.cancel_cond:
             if _State.get_state_by_ident(self.ident) is None:
-                # if this occurs, the thread has already terminated, no need to interrupt
+                # Thread terminated while we waited on the lock; nothing to do.
                 return
-            st.cancel_sleep_notified = st.sleeping
-            st.cancel_select_notified = st.selecting
-            if st.cancel_sleep_notified:
-                st.cancel_cond.notify()
-            elif st.cancel_select_notified:
-                try:
-                    os.write(st.wfd, b"\x00")
-                except OSError:
-                    pass
+            if st.pending:
+                # Already requested -- idempotent. Re-nudge in case a prior wakeup
+                # was missed; never re-arm async injection.
+                self._nudge(st)
+                return
+            st.pending = True
+            st.interrupt_gen += 1
+
+            if st.event_loop is not None:
+                # Running an asyncio loop: cancel tasks cooperatively.
+                self._cancel_event_loop(st)
+            elif st.mask_depth > 0:
+                # Masked: record + unblock so it loops to its mask check; the
+                # pending flag is delivered when the mask exits.
+                self._nudge(st)
+            elif st.sleeping:
+                st.cancel_cond.notify_all()
+            elif st.selecting and st.wfd != -1:
+                self._pipe_write(st)
             else:
-                self._raise_keyboard_interrupt_in_thread()
+                # Pure-Python (or un-patched C) execution: deliver via async
+                # injection. That exception *is* the delivery, so clear the flag
+                # to avoid a second raise at the next checkpoint if the thread
+                # catches and continues. Best-effort for never-returning C calls
+                # (an accepted limitation -- see README).
+                self._inject_exc()
+                st.pending = False
 
     @classmethod
     def get_thread_cls_for_current_thread(cls, item: str) -> type[threading.Thread]:
@@ -276,29 +722,66 @@ class InterruptibleThread(_ORIG_THREAD):
             return cls
 
     @classmethod
-    def install_patches(cls) -> None:
+    def install_patches(
+        cls,
+        interrupt_exc: type[BaseException] = ThreadInterrupted,
+        legacy_keyboardinterrupt: bool = False,
+        monkeypatch_socket: bool = False,
+    ) -> None:
+        """Install the stdlib monkeypatches that make blocking calls interruptible.
+
+        ``interrupt_exc``: the exception class delivered by ``interrupt()``
+        (default ``ThreadInterrupted``; pass ``KeyboardInterrupt`` for legacy code).
+        ``legacy_keyboardinterrupt``: deliver an exception caught by *both*
+        ``ThreadInterrupted`` and ``KeyboardInterrupt`` handlers.
+        ``monkeypatch_socket``: also swap blocking ``socket.recv/send/accept`` for
+        their interruptible variants process-wide (off by default; large blast radius).
+        """
+        global _INTERRUPT_EXC
         if cls._patches_installed:
             raise ValueError("patches already installed")
         cls._patches_installed = True
-        time.sleep = _coop_sleep  # type: ignore[assignment]
-        selectors.DefaultSelector = _InterruptibleSelector  # type: ignore[assignment]
-        select.select = _patched_select  # type: ignore[assignment]
+
+        if legacy_keyboardinterrupt:
+            _INTERRUPT_EXC = _ThreadInterruptedKeyboard
+        else:
+            _INTERRUPT_EXC = interrupt_exc
+
+        time.sleep = _coop_sleep  # type: ignore
+        selectors.DefaultSelector = _InterruptibleSelector  # type: ignore
+        select.select = _patched_select  # type: ignore
+        threading.Condition.wait = _patched_cond_wait  # type: ignore
+
+        if monkeypatch_socket:
+            cls._socket_patched = True
+            _socket.socket.recv = _sock_recv_patch  # type: ignore
+            _socket.socket.send = _sock_send_patch  # type: ignore
+            _socket.socket.accept = _sock_accept_patch  # type: ignore
+
         del threading.Thread
-        threading.__getattr__ = cls.get_thread_cls_for_current_thread
+        threading.__getattr__ = cls.get_thread_cls_for_current_thread  # type: ignore
 
         def __dir__():
             return list(threading.__dict__.keys()) + [_ORIG_THREAD.__name__]
 
-        threading.__dir__ = __dir__
+        threading.__dir__ = __dir__  # type: ignore
 
     @classmethod
     def uninstall_patches(cls) -> None:
+        global _INTERRUPT_EXC
         if not cls._patches_installed:
             raise ValueError("patches not installed")
+        cls._patches_installed = False
         time.sleep = _ORIG_SLEEP
-        select.select = _ORIG_SELECT
-        selectors.DefaultSelector = _ORIG_DEFAULT_SELECTOR
-        threading.Thread = _ORIG_THREAD
+        select.select = _ORIG_SELECT  # type: ignore
+        selectors.DefaultSelector = _ORIG_DEFAULT_SELECTOR  # type: ignore
+        threading.Condition.wait = _ORIG_COND_WAIT  # type: ignore
+        if cls._socket_patched:
+            _socket.socket.recv = _ORIG_SOCK_RECV  # type: ignore
+            _socket.socket.send = _ORIG_SOCK_SEND  # type: ignore
+            _socket.socket.accept = _ORIG_SOCK_ACCEPT  # type: ignore
+            cls._socket_patched = False
+        threading.Thread = _ORIG_THREAD  # type: ignore
         del threading.__getattr__  # type: ignore
         del threading.__dir__  # type: ignore
-
+        _INTERRUPT_EXC = ThreadInterrupted
