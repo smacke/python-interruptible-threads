@@ -159,6 +159,11 @@ class _State:
             if self.rfd == -1:
                 r, w = os.pipe()
                 os.set_blocking(r, False)
+                # The write end must also be non-blocking: ``_pipe_write`` runs
+                # while holding ``cancel_cond``, and a blocking ``os.write`` to a
+                # full pipe would deadlock. A full pipe already means a wakeup is
+                # pending, so dropping the extra byte (EAGAIN) is correct.
+                os.set_blocking(w, False)
                 self.rfd, self.wfd = r, w
 
     @classmethod

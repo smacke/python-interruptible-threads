@@ -40,6 +40,34 @@ def patched():
         InterruptibleThread.uninstall_patches()
 
 
+@pytest.fixture(autouse=True)
+def _no_leaked_workers():
+    """Ensure no worker thread outlives its test.
+
+    Most tests only ``res.done.wait(...)`` and never ``t.join()``, so a worker can
+    still be unwinding ``InterruptibleThread.run()``'s cleanup when the test ends.
+    A daemon worker that is still alive at pytest session finish can deadlock
+    pytest-cov's coverage-data save (collector lock vs. a live traced thread) --
+    which is exactly how a CI job once hung for 6h. Interrupt and join any
+    stragglers here, and fail loudly if one cannot be joined.
+    """
+    yield
+    stragglers = [
+        t
+        for t in threading.enumerate()
+        if isinstance(t, InterruptibleThread) and t.is_alive()
+    ]
+    for t in stragglers:
+        try:
+            t.interrupt(recursive=True)
+        except (ValueError, RuntimeError):
+            pass
+    for t in stragglers:
+        t.join(5)
+    leaked = [t for t in stragglers if t.is_alive()]
+    assert not leaked, f"worker(s) outlived the test (possible hang): {leaked}"
+
+
 class Result:
     """Captures a worker's outcome and exposes lifecycle events."""
 

@@ -7,6 +7,11 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    # Backstop: this suite finishes in well under a minute. If a job ever wedges
+    # (e.g. a worker deadlocking pytest-cov's shutdown), fail fast instead of
+    # burning the full 6h GitHub default.
+    timeout-minutes: 10
+
     strategy:
       matrix:
         os: [ 'ubuntu-22.04' ]
