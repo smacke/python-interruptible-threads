@@ -5,6 +5,7 @@ Patches mutate global stdlib state, so each test installs/uninstalls via the
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
 import socket
@@ -29,6 +30,16 @@ pytestmark = pytest.mark.timeout(30)
 
 # Real (unpatched) sleep for use by the main test thread while patches are live.
 _REAL_SLEEP = time.sleep
+
+# Async injection (PyThreadState_SetAsyncExc) is disabled while a trace hook is
+# active (e.g. coverage's C tracer on <=3.11), since it can deadlock the target.
+# Tests that can only be delivered by async injection -- a pure-Python loop with
+# no checkpoint -- are skipped in that case. They still run under plain pytest
+# (no coverage) and under coverage's sys.monitoring core (3.12+).
+needs_async_injection = pytest.mark.skipif(
+    it._tracing_active(),
+    reason="async injection disabled under an active trace hook (coverage C tracer)",
+)
 
 
 @pytest.fixture
@@ -106,6 +117,7 @@ def spin(seconds: float) -> None:
 # --------------------------------------------------------------------------- #
 
 
+@needs_async_injection
 def test_async_injection_breaks_pure_python_loop(patched):
     def fn(res):
         while True:
@@ -146,6 +158,73 @@ def test_sleep_interrupt_race_stress(patched):
         assert isinstance(res.exc, ThreadInterrupted)
         t.join(2)
         assert not t.is_alive()
+
+
+@contextlib.contextmanager
+def _global_tracing():
+    """Ensure a trace hook is active globally (main + every spawned thread), as
+    coverage's C tracer is, so ``_tracing_active()`` is True and ``interrupt()``
+    must deliver cooperatively (no async injection). If already tracing (running
+    under coverage), do nothing; otherwise install a no-op tracer and restore.
+    """
+    if it._tracing_active():
+        yield
+        return
+
+    def _tracer(frame, event, arg):
+        return _tracer
+
+    old_sys = sys.gettrace()
+    sys.settrace(_tracer)
+    threading.settrace(_tracer)
+    try:
+        assert it._tracing_active()
+        yield
+    finally:
+        # Nothing was installed before (we checked), so restoring to None is safe.
+        threading.settrace(None)  # type: ignore[arg-type]
+        sys.settrace(old_sys)
+
+
+def test_interrupt_not_lost_entering_sleep_under_tracing(patched):
+    # Regression for the lost-wakeup race that hung CI: interrupt() fires while
+    # the worker has decided to block but has not yet committed to the primitive
+    # (the sleeping/selecting hints still read False). Under tracing, async
+    # injection is disabled, so only the durable `pending` flag delivers -- and
+    # the zero-delay interrupt lands the worker mid-entry into the sleep.
+    with _global_tracing():
+        for _ in range(60):
+
+            def fn(res):
+                time.sleep(100)
+
+            t, res = run_worker(fn)
+            t.interrupt()  # no delay: worker is entering _coop_sleep right now
+            assert res.done.wait(3), "interrupt was lost; worker slept through it"
+            assert isinstance(res.exc, ThreadInterrupted)
+            t.join(2)
+            assert not t.is_alive()
+
+
+def test_interrupt_sleeping_thread_under_tracing_no_deadlock(patched):
+    # Regression for the deadlock that hung CI under coverage. Two distinct bugs
+    # met here: (1) every cooperative delivery called PyThreadState_SetAsyncExc
+    # to clear a possibly-armed async exception, and (2) interrupt() async-injected
+    # speculatively. Either SetAsyncExc call wedges a lock-touching thread while a
+    # trace hook is active. With a global tracer installed, neither may fire.
+    with _global_tracing():
+        for _ in range(60):
+
+            def fn(res):
+                time.sleep(100)
+
+            t, res = run_worker(fn)
+            _REAL_SLEEP(0.02)  # let the worker reach the parked cond.wait
+            t.interrupt()
+            assert res.done.wait(3), "deadlock: interrupt under tracer never delivered"
+            assert isinstance(res.exc, ThreadInterrupted)
+            t.join(2)
+            assert not t.is_alive()
 
 
 def test_select_interrupted(patched):
@@ -330,6 +409,7 @@ def test_clear_interrupt(patched):
     assert res.exc is None
 
 
+@needs_async_injection
 def test_caught_async_interrupt_not_redelivered(patched):
     def fn(res):
         try:
@@ -337,7 +417,11 @@ def test_caught_async_interrupt_not_redelivered(patched):
                 pass
         except ThreadInterrupted:
             res.caught = True
-        # The flag was consumed by delivery; further checkpoints must not re-raise.
+            # The durable pending flag survives an async-injected delivery (so a
+            # thread that parks before the injection fires is never lost); a
+            # thread that catches and *continues* clears it explicitly, Java's
+            # Thread.interrupted() style. After that, checkpoints must not raise.
+            clear_interrupt()
         for _ in range(10000):
             check_interrupt()
         res.no_redeliver = True

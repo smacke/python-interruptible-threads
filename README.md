@@ -125,6 +125,11 @@ def worker():
 - **Async injection lands at an arbitrary bytecode boundary** and is un-recallable, so
   `critical_section()` is airtight only for the flag-driven paths; prefer
   checkpoints/blocking primitives inside code that must not be interrupted mid-cleanup.
+- **Catch-and-continue clears the flag explicitly.** The interrupt-pending flag is
+  durable (so an interrupt is never lost if the target parks in a blocking call before
+  async injection can fire). Consequently, if you *catch* `ThreadInterrupted` and want to
+  keep running, call `clear_interrupt()` — otherwise the next `check_interrupt()` /
+  blocking primitive re-raises. This mirrors Java's `Thread.interrupted()`.
 - **`install_patches()` mutates global stdlib state.** Code that captured references
   before install (e.g. `from time import sleep`) keeps the originals. Not for libraries
   to call implicitly.

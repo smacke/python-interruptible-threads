@@ -19,6 +19,9 @@ profile = 'black'
 [tool.pytest.ini_options]
 testpaths = ['tests']
 timeout = 60
+# Dump every thread's stack (C-level, GIL-independent) if any test wedges past
+# this, so a hard deadlock leaves a diagnosable trace instead of silent silence.
+faulthandler_timeout = 45
 filterwarnings = [
     'ignore::DeprecationWarning',
 ]

@@ -34,6 +34,7 @@ import os
 import select
 import selectors
 import socket as _socket
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -114,6 +115,26 @@ def _clear_async_exc(tid: int | None = None) -> None:
     )
 
 
+def _tracing_active() -> bool:
+    """Whether a trace/profile hook is installed (coverage, a debugger, a
+    profiler) anywhere we can observe.
+
+    ``PyThreadState_SetAsyncExc`` can permanently wedge a thread that is doing
+    lock operations while such a hook is active (a CPython interaction), so async
+    injection -- the only delivery path that uses it -- is skipped while tracing.
+    Cooperative delivery via the durable ``pending`` flag is unaffected.
+    """
+    if sys.gettrace() is not None or sys.getprofile() is not None:
+        return True
+    # threading.gettrace/getprofile (3.10+) expose the global hook coverage
+    # installs for worker threads; guarded for 3.9 where they don't exist.
+    for name in ("gettrace", "getprofile"):
+        getter = getattr(threading, name, None)
+        if getter is not None and getter() is not None:
+            return True
+    return False
+
+
 def _drain(fd: int) -> None:
     """Drain a non-blocking wakeup pipe until empty."""
     while True:
@@ -143,6 +164,11 @@ class _State:
         self.pending = False
         self.interrupt_gen = 0
         self.mask_depth = 0
+        # True only while an async exception has actually been armed for this
+        # thread via PyThreadState_SetAsyncExc. Gates the ctypes "clear" call so
+        # the cooperative paths never touch SetAsyncExc -- calling it while a
+        # sys.settrace tracer (e.g. coverage) is active can deadlock the thread.
+        self.async_armed = False
         # Hints used only to pick a wakeup nudge; never the source of truth.
         self.sleeping = False
         self.selecting = False
@@ -197,6 +223,19 @@ class _State:
             st.rfd = st.wfd = -1
 
 
+def _disarm_async(st: _State) -> None:
+    """Clear an armed async exception for the current thread, but only if one was
+    actually armed. ``PyThreadState_SetAsyncExc`` must not be called speculatively:
+    invoking it while a ``sys.settrace`` tracer (e.g. coverage) is active can wedge
+    the thread, so the cooperative paths -- which never arm one -- must skip it.
+
+    Must be called holding ``st.cancel_cond``.
+    """
+    if st.async_armed:
+        st.async_armed = False
+        _clear_async_exc()
+
+
 def _take_pending(st: _State) -> bool:
     """If an unmasked interrupt is pending, consume it and clear any armed async
     exception, returning True (caller should raise). Otherwise return False.
@@ -205,7 +244,7 @@ def _take_pending(st: _State) -> bool:
     """
     if st.pending and st.mask_depth == 0:
         st.pending = False
-        _clear_async_exc()
+        _disarm_async(st)
         return True
     return False
 
@@ -232,6 +271,11 @@ def clear_interrupt() -> bool:
     """Consume any pending interrupt for the current thread without raising.
 
     Returns whether one was pending (Java's ``Thread.interrupted()`` semantics).
+
+    Call this after *catching* ``ThreadInterrupted`` when you intend to keep
+    running: the pending flag is durable (so an interrupt is never lost if the
+    thread parks in a blocking call before async injection can fire), so without
+    clearing it the next checkpoint or blocking primitive would re-raise.
     """
     st = _State.get_state_by_ident()
     if st is None:
@@ -240,7 +284,7 @@ def clear_interrupt() -> bool:
         prev = st.pending
         st.pending = False
         if prev:
-            _clear_async_exc()
+            _disarm_async(st)
         return prev
 
 
@@ -316,7 +360,7 @@ def interrupts_disabled() -> Iterator[None]:
             st.mask_depth -= 1
             if st.mask_depth == 0 and st.pending:
                 st.pending = False
-                _clear_async_exc()
+                _disarm_async(st)
                 raise_now = True
         if raise_now:
             raise _INTERRUPT_EXC()
@@ -708,13 +752,31 @@ class InterruptibleThread(_ORIG_THREAD):
             elif st.selecting and st.wfd != -1:
                 self._pipe_write(st)
             else:
-                # Pure-Python (or un-patched C) execution: deliver via async
-                # injection. That exception *is* the delivery, so clear the flag
-                # to avoid a second raise at the next checkpoint if the thread
-                # catches and continues. Best-effort for never-returning C calls
-                # (an accepted limitation -- see README).
-                self._inject_exc()
-                st.pending = False
+                # Pure-Python execution, or a thread that has *decided* to block
+                # but not yet committed (so the sleeping/selecting hints still
+                # read False -- common under tracing/coverage). Async-inject to
+                # break a CPU loop, and also nudge every cooperative channel in
+                # case the thread is entering a primitive right now.
+                #
+                # Crucially, do NOT clear `pending`. It is the durable source of
+                # truth: if async injection cannot fire (the thread parks in a
+                # C-level wait before the next bytecode boundary), the primitive
+                # still sees `pending` on its pre-block / post-wake check and
+                # raises. The cooperative consumer (`_take_pending`) clears the
+                # flag and disarms the async exception together, so delivery is
+                # exactly-once via whichever path wins. (A thread that *catches*
+                # an async-injected interrupt and continues must call
+                # `clear_interrupt()` -- see its docstring.)
+                self._nudge(st)
+                # Async injection uses PyThreadState_SetAsyncExc, which can
+                # deadlock the target under an active trace hook (coverage /
+                # debuggers); skip it then. Any thread that reaches a checkpoint
+                # or blocking primitive is still delivered via the durable flag;
+                # only a checkpoint-less pure-Python loop is left uninterruptible
+                # while tracing (a narrow, documented gap).
+                if not _tracing_active():
+                    self._inject_exc()
+                    st.async_armed = True
 
     @classmethod
     def get_thread_cls_for_current_thread(cls, item: str) -> type[threading.Thread]:
