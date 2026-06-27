@@ -1,2 +1,4 @@
 include README.md docs/LICENSE.txt
 recursive-exclude tests *
+include versioneer.py
+include interruptible_threading/_version.py

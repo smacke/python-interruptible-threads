@@ -31,7 +31,7 @@ lint:
 	ruff check
 
 typecheck:
-	mypy interruptible_threading.py
+	mypy interruptible_threading
 
 check_no_typing:
 	rm -f .coverage

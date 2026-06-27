@@ -852,3 +852,8 @@ class InterruptibleThread(_ORIG_THREAD):
         del threading.__getattr__  # type: ignore
         del threading.__dir__  # type: ignore
         _INTERRUPT_EXC = ThreadInterrupted
+
+
+from . import _version  # noqa: E402
+
+__version__ = _version.get_versions()["version"]

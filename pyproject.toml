@@ -12,9 +12,15 @@ enabled = true
 [tool.black]
 line-length = 88
 target-version = ['py39']
+extend-exclude = '(^/versioneer|^/interruptible_threading/_version)\.py'
 
 [tool.isort]
 profile = 'black'
+extend_skip_glob = [
+    '**/versioneer.py',
+    '**/_version.py',
+    '**/setup.py',
+]
 
 [tool.pytest.ini_options]
 testpaths = ['tests']
@@ -28,6 +34,7 @@ filterwarnings = [
 
 [tool.coverage.run]
 source = ['interruptible_threading']
+omit = ['interruptible_threading/_version.py', 'interruptible_threading/version.py']
 
 [tool.coverage.report]
 exclude_lines = [
